@@ -35,39 +35,100 @@ struct MinimumData {
 
 __global__ void compute_min(MinimumData* m_ptr) {
   MinimumData& m = *m_ptr;
-  assert(m.data.size() % (blockDim.x * gridDim.x) == 0);
-  assert(gridDim.x == 0);
+  assert(gridDim.x != 0);
+  // block scope only:
   __shared__ BlockAsynchronousFixpointGPU<true> fp_engine;
-  size_t chunk_size = m.data.size() / gridDim.x;
+  // renamed chunk to block:
+  size_t block_size = m.data.size() / gridDim.x;
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+      printf("--- kernel: block_size=%3lu\n", block_size);
+  }
   __syncthreads();
   m.iterations = fp_engine.fixpoint(
-    chunk_size,
-    [&](int i) { return m.min_val.meet(m.data[chunk_size * blockIdx.x + i]); }
+    block_size,
+    [&](int i) { return m.min_val.meet(m.data[block_size * blockIdx.x + i]); },
+    []() { return false; }
+  );
+}
+
+__global__ void compute_min2(MinimumData* m_ptr) {
+  MinimumData& m = *m_ptr;
+  size_t block_size = m.data.size() / gridDim.x;
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  // block scope only:
+  __shared__ BlockAsynchronousFixpointGPU<true> fp_engine;
+  __shared__ UB<int> block_min_val;
+  if (threadIdx.x == 0) {
+      block_min_val = m.min_val;  // operator= 
+  }
+  __syncthreads();  // block-scope, fast
+  // verify the shared allocations
+  if (threadIdx.x == 0) {
+      printf("--- kernel: tid=%3d, block_size=%3lu\n", tid, block_size);
+      printf("--- kernel: tid=%3d, engine*=%p\n", tid, &fp_engine);
+      printf("--- kernel: tid=%3d, block_min_val*=%p\n", tid, &block_min_val);
+  }
+  m.iterations = fp_engine.fixpoint(
+    block_size,
+    [&](int i) { return block_min_val.meet(m.data[block_size * blockIdx.x + i]); },
+    [&]() { m.min_val = block_min_val; __threadfence(); return true; }
   );
 }
 
 #define TPB 256
-#define NUM_BLOCKS 1
-#define NUM_SECTIONS 1000000
+#define NUM_SECTIONS (2<<14)
 
 int main(int argc, char** argv) {
-  size_t n = TPB * NUM_BLOCKS * NUM_SECTIONS;
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  float elapsedTime;
+
+  size_t n = TPB * NUM_SECTIONS;
   auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(n);
   init_random_vector(gpu_data->data);
 
   std::cout << "Data initialized. Starting GPU benchmarks." << std::endl;
 
-  // On GPU, using a block-parallel fixpoint algorithm.
-  compute_min<<<NUM_BLOCKS, TPB>>>(gpu_data.get());
-  CUDAEX(cudaDeviceSynchronize());
-  std::cout << "GPU Minimum: " << gpu_data->min_val << std::endl;
-  std::cout << "  iterations: " << gpu_data->iterations << std::endl;
-
   // On CPU, using a sequential fixpoint algorithm.
   GaussSeidelIteration fp_engine;
   UB<int> cpu_min_val;
   fp_engine.iterate(gpu_data->data.size(), [&](int i) { return cpu_min_val.meet(gpu_data->data[i]); });
-  std::cout << "CPU Minimum: " << cpu_min_val << std::endl;
+  std::cout << "CPU Minimum: " << std::endl;
+  std::cout << "  minimum: " << cpu_min_val << std::endl;
+
+  // On GPU, using a block-parallel fixpoint algorithm.
+  gpu_data->min_val.join_top();
+  std::cout << "GPU Minimum 1 block" << std::endl;
+  std::cout << "  initially: " << gpu_data->min_val << std::endl;
+  cudaEventRecord(start, 0);
+  compute_min<<<1, TPB>>>(gpu_data.get());
+  CUDAEX(cudaDeviceSynchronize());
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&elapsedTime, start, stop);
+  std::cout << "  minimum: " << gpu_data->min_val;
+  std::cout << "  iterations: " << gpu_data->iterations;
+  std::cout << "  elapsed (ms): " << elapsedTime << std::endl;
+
+  // On GPU, using a grid parallel fixpoint algorithm.
+  gpu_data->min_val.join_top();
+  std::cout << "GPU Minimum 2 blocks " << std::endl;
+  std::cout << "  initially: " << gpu_data->min_val << std::endl;
+  cudaEventRecord(start, 0);
+  compute_min2<<<2, TPB>>>(gpu_data.get());
+  CUDAEX(cudaDeviceSynchronize());
+  cudaEventRecord(stop, 0);
+  cudaEventSynchronize(stop);
+  cudaEventElapsedTime(&elapsedTime, start, stop);
+  std::cout << "  minimum: " << gpu_data->min_val;
+  std::cout << "  iterations: " << gpu_data->iterations;
+  std::cout << "  elapsed (ms): " << elapsedTime << std::endl;
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+
   if(cpu_min_val != gpu_data->min_val) {
     std::cout << "!! error detected" << std::endl;
   }

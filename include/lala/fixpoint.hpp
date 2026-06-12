@@ -115,18 +115,21 @@ public:
    * \param `has_changed` is set to `true` if we were not yet in a fixpoint.
    * \return The number of iterations required to reach a fixpoint or until `must_stop()` returns `true`.
   */
-  template <class F, class StopFun, class M>
-  CUDA int fixpoint(int n, const F& f, const StopFun& must_stop, LB<bool, M>& has_changed) {
+  template <class F, class G, class StopFun, class M>
+  CUDA int fixpoint(int n, const F& f, const G& g, const StopFun& must_stop, LB<bool, M>& has_changed) {
     reset();
     barrier();
     int i;
     for(i = 1; changed[(i-1)%3] && !stop[(i-1)%3]; ++i) {
-      changed[i%3].meet(iterate(n, f));
+      changed[i%3].meet(iterate(n, f));  // changed[i] == false
       if(is_thread0()) {
         changed[(i+1)%3].join_top(); // reinitialize changed for the next iteration.
         stop[i%3].meet(must_stop());
       }
       barrier();
+      if (is_thread0()) {
+        g();
+      }
     }
     // It changes if we performed several iteration, or if the first iteration changed the abstract domain.
     if(is_thread0()) {
@@ -135,8 +138,8 @@ public:
     return i - 1;
   }
 
-  template <class F, class Iter, class StopFun>
-  CUDA int fixpoint(int n, const F& f, const Iter& h, const StopFun& must_stop) {
+  template <class F, class G, class Iter, class StopFun>
+  CUDA int fixpoint(int n, const F& f, const G& g, const Iter& h, const StopFun& must_stop) {
     reset();
     barrier();
     int i;
@@ -154,23 +157,23 @@ public:
   }
 
   /** Same as `fixpoint` above without `has_changed`. */
-  template <class F, class StopFun>
-  CUDA INLINE int fixpoint(int n, const F& f, const StopFun& must_stop) {
+  template <class F, class G, class StopFun>
+  CUDA INLINE int fixpoint(int n, const F& f, const G& g, const StopFun& must_stop) {
     LB<bool> has_changed(false);
-    return fixpoint(n, f, must_stop, has_changed);
+    return fixpoint(n, f, g, must_stop, has_changed);
   }
 
   /** Same as `fixpoint` above with `must_stop` always returning `false`. */
-  template <class F, class M>
-  CUDA INLINE int fixpoint(int n, const F& f, LB<bool, M>& has_changed) {
-    return fixpoint(n, f, [](){ return false; }, has_changed);
+  template <class F, class G, class M>
+  CUDA INLINE int fixpoint(int n, const F& f, const G& g, LB<bool, M>& has_changed) {
+    return fixpoint(n, f, g, [](){ return false; }, has_changed);
   }
 
   /** Same as `fixpoint` above without `has_changed` and with `must_stop` always returning `false`. */
-  template <class F>
-  CUDA INLINE int fixpoint(int n, const F& f) {
+  template <class F, class G>
+  CUDA INLINE int fixpoint(int n, const F& f, const G& g) {
     LB<bool> has_changed(false);
-    return fixpoint(n, f, has_changed);
+    return fixpoint(n, f, g, has_changed);
   }
 };
 
@@ -285,7 +288,7 @@ public:
     bool has_changed = false;
     int n2 = syncwarp && n != 0 ? max(n,n+(32-(n%32))) : n;
     for (int i = threadIdx.x; i < n2; i += blockDim.x) {
-      has_changed |= f(syncwarp ? (i >= n ? n-1 : i) : i);
+      has_changed |= f(syncwarp ? (i >= n ? n-1 : i) : i);  // |= because stride wants OR all f(i)
     }
     return has_changed;
   #endif
