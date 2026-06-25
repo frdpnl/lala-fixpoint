@@ -9,7 +9,8 @@ We want to push this model and see how many standard algorithms we can reimpleme
 
 - [x] Import and clean fixpoint algorithms from lala-core.
 - [x] Algorithm: finding the minimum in a sequence.
-- [ ] Improve minimum algorithm to support computation over a grid and multi-grid.
+- [x] Improve minimum algorithm to support computation over a grid.
+- [ ] Improve minimum algorithm to support computation over a multi-grid.
 - [ ] Algorithm: search an element in an unsorted list.
 - [ ] Algorithm: union-find.
 - [ ] Algorithm: breadth-first search algorithm.
@@ -37,3 +38,18 @@ cmake --workflow --preset gpu-release-local --fresh
 ```
 
 You can add new binaries in `CMakeLists.txt`.
+
+## Log
+```
+$ ./build/gpu-release-local/minimum
+Data initialized. Starting GPU benchmarks.
+CPU Minimum:
+  minimum: -999999914
+GPU Minimum with 1 block
+  initially: ∞
+  minimum: -999999914  iterations: 5  elapsed: 344.802 ms
+GPU Minimum on 2 blocks (max: 8 * 108 = 864) with cooperative_groups shared mem max: 163 kiB
+  initially: ∞
+  minimum: -999999914  iterations: 6  elapsed: 191.321 ms
+``
+
