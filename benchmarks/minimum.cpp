@@ -61,6 +61,7 @@ __global__ void compute_min_grid(MinimumData* m_ptr) {
 
 #define TPB 256
 #define NUM_SECTIONS (2<<16)
+#define N TPB*NUM_SECTIONS
 
 int main(int argc, char** argv) {
   cudaEvent_t start, stop;
@@ -68,8 +69,7 @@ int main(int argc, char** argv) {
   cudaEventCreate(&stop);
   float elapsedTime;
 
-  size_t n = TPB * NUM_SECTIONS;
-  auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(n);
+  auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(N);
   init_random_vector(gpu_data->data);
 
   std::cout << "Data initialized. Starting GPU benchmarks." << std::endl;
@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
   // On GPU, using a block-parallel fixpoint algorithm.
   gpu_data->min_val.join_top();
   int blocks = 1;
-  std::cout << "GPU Minimum with " << blocks <<  " blocks" << std::endl;
+  std::cout << "GPU Minimum with " << blocks <<  " block(s)" << std::endl;
   std::cout << "  initially: " << gpu_data->min_val << std::endl;
   cudaEventRecord(start, 0);
   compute_min<<<blocks, TPB>>>(gpu_data.get());
