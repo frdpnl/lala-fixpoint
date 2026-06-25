@@ -103,10 +103,6 @@ public:
     static_cast<IteratorEngine*>(this)->barrier();
   }
 
-  CUDA INLINE void barrier_block() {
-    static_cast<IteratorEngine*>(this)->barrier_block();
-  }
-
   template <class F>
   CUDA INLINE bool iterate(int n, const F& f) const {
     return static_cast<const IteratorEngine*>(this)->iterate(n, f);
@@ -130,7 +126,7 @@ public:
         changed[(i+1)%3].join_top(); // reinitialize changed for the next iteration.
         stop[i%3].meet(must_stop());
       }
-      barrier_block();
+      barrier();
     }
     // It changes if we performed several iteration, or if the first iteration changed the abstract domain.
     if(is_thread0()) {
@@ -183,8 +179,12 @@ public:
  * This is called an asynchronous iteration and it is due to (Cousot, Asynchronous iterative methods for solving a fixed point system of monotone equations in a complete lattice, 1977).
  * \tparam Group is a CUDA cooperative group class (note that we provide a more efficient implementation for block group below in `BlockAsynchronousIterationGPU`).
 */
-class AsynchronousIterationGPU : public AsynchronousFixpoint<AsynchronousIterationGPU> {
+template <class Group>
+class AsynchronousIterationGPU : public AsynchronousFixpoint<AsynchronousIterationGPU<Group>> {
+public:
+  using group_type = Group;
 private:
+  Group group;
 
   CUDA void assert_cuda_arch() const {
     printf("AsynchronousIterationGPU must be used on the GPU device only.\n");
@@ -192,7 +192,9 @@ private:
   }
 
 public:
-  AsynchronousIterationGPU() = default;
+  CUDA AsynchronousIterationGPU(const Group& group):
+    group(group)
+  {}
 
   CUDA void reset() const {}
 
@@ -201,7 +203,7 @@ public:
       assert_cuda_arch();
       return false;
   #else
-    return cooperative_groups::this_thread_block().thread_rank() == 0;
+    return group.thread_rank() == 0;
   #endif
   }
 
@@ -210,15 +212,7 @@ public:
   #ifndef __CUDA_ARCH__
       assert_cuda_arch();
   #else
-      cooperative_groups::this_grid().sync();
-  #endif
-  }
-
-  CUDA INLINE void barrier_block() {
-  #ifndef __CUDA_ARCH__
-      assert_cuda_arch();
-  #else
-      cooperative_groups::this_thread_block().sync();
+    group.sync();
   #endif
   }
 
@@ -234,17 +228,15 @@ public:
     return false;
   #else
     bool has_changed = false;
-    auto bg = cooperative_groups::this_thread_block();
-    for (int i = bg.thread_rank(); i < n; i += bg.num_threads()) {
+    for (int i = group.thread_rank(); i < n; i += group.num_threads()) {
       has_changed |= f(i);
     }
-    cooperative_groups::this_grid().sync();
     return has_changed;
   #endif
   }
 };
 
-//using GridAsynchronousFixpointGPU = AsynchronousIterationGPU<cooperative_groups::grid_group>;
+using GridAsynchronousFixpointGPU = AsynchronousIterationGPU<cooperative_groups::grid_group>;
 
 /** An optimized version of `AsynchronousIterationGPU` when the fixpoint is computed on a single block.
  * We avoid the use of cooperative groups which take extra memory space.
@@ -271,14 +263,6 @@ public:
   }
 
   CUDA INLINE void barrier() {
-  #ifndef __CUDA_ARCH__
-      assert_cuda_arch();
-  #else
-    __syncthreads();
-  #endif
-  }
-
-  CUDA INLINE void barrier_block() {
   #ifndef __CUDA_ARCH__
       assert_cuda_arch();
   #else

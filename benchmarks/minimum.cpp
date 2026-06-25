@@ -40,10 +40,6 @@ __global__ void compute_min(MinimumData* m_ptr) {
   assert(gridDim.x != 0);
   __shared__ BlockAsynchronousFixpointGPU<true> fp_engine;
   size_t block_size = m.data.size() / gridDim.x;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (threadIdx.x == 0) {
-      printf("--- kernel: tid=%3d, block_size=%3lu\n", tid, block_size);
-  }
   __syncthreads();
   m.iterations = fp_engine.fixpoint(
     block_size,
@@ -51,18 +47,16 @@ __global__ void compute_min(MinimumData* m_ptr) {
   );
 }
 
-__global__ void compute_min_g(MinimumData* m_ptr) {
+__global__ void compute_min_grid(MinimumData* m_ptr) {
   MinimumData& m = *m_ptr;
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t block_size = m.data.size() / gridDim.x;
-  if (threadIdx.x == 0) {
-      printf("--- kernel: tid=%3d, block_size=%3lu\n", tid, block_size);
-  }
-  __shared__ AsynchronousIterationGPU fp_engine;
+  battery::unique_ptr<GridAsynchronousFixpointGPU, battery::global_allocator> fp_engine_ptr;
+  auto g = cg::this_grid();
+  GridAsynchronousFixpointGPU& fp_engine = battery::make_unique_grid(fp_engine_ptr, g);
   m.iterations = fp_engine.fixpoint(
-    block_size,
-    [&](int i) { return m.min_val.meet(m.data[block_size * blockIdx.x + i]); }
+    m.data.size(),
+    [&](int i) { return m.min_val.meet(m.data[i]); }
   );
+  g.sync();
 }
 
 #define TPB 256
@@ -89,66 +83,48 @@ int main(int argc, char** argv) {
 
   // On GPU, using a block-parallel fixpoint algorithm.
   gpu_data->min_val.join_top();
-  std::cout << "GPU Minimum 1 block" << std::endl;
+  int blocks = 1;
+  std::cout << "GPU Minimum with " << blocks <<  " blocks" << std::endl;
   std::cout << "  initially: " << gpu_data->min_val << std::endl;
   cudaEventRecord(start, 0);
-  compute_min<<<1, TPB>>>(gpu_data.get());
+  compute_min<<<blocks, TPB>>>(gpu_data.get());
   CUDAEX(cudaDeviceSynchronize());
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&elapsedTime, start, stop);
   std::cout << "  minimum: " << gpu_data->min_val;
   std::cout << "  iterations: " << gpu_data->iterations;
-  std::cout << "  elapsed (ms): " << elapsedTime << std::endl;
+  std::cout << "  elapsed: " << elapsedTime << " ms" << std::endl;
   if(cpu_min_val != gpu_data->min_val) {
     std::cout << "!! error detected" << std::endl;
   }
 
-  // On GPU, using a block-parallel fixpoint algorithm.
+  // On GPU, using a grid-parallel fixpoint algorithm.
   gpu_data->min_val.join_top();
-  std::cout << "GPU Minimum 2 blocks, no synchronization (benchmark only)" << std::endl;
-  std::cout << "  initially: " << gpu_data->min_val << std::endl;
-  cudaEventRecord(start, 0);
-  compute_min<<<2, TPB>>>(gpu_data.get());
-  CUDAEX(cudaDeviceSynchronize());
-  cudaEventRecord(stop, 0);
-  cudaEventSynchronize(stop);
-  cudaEventElapsedTime(&elapsedTime, start, stop);
-  std::cout << "  minimum: " << gpu_data->min_val;
-  std::cout << "  iterations: " << gpu_data->iterations;
-  std::cout << "  elapsed (ms): " << elapsedTime << std::endl;
-  if(cpu_min_val != gpu_data->min_val) {
-    std::cout << "!! error detected" << std::endl;
-  }
-
-  // On GPU, using a grid parallel fixpoint algorithm.
-  int device = 0, maxShmemSz = 0;
+  int device = 0, maxShmemSz = 0, nProc = 0, maxBlocksPerSM = 0;
   cudaGetDevice(&device);
-  gpu_data->min_val.join_top();
-  std::cout << "GPU Minimum 2 blocks with cooperative_groups" << std::endl;
-  std::cout << "  initially: " << gpu_data->min_val << std::endl;
+  blocks = 2;
   cudaDeviceGetAttribute(&maxShmemSz, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-  //cudaDeviceProp deviceProp;
-  //cudaGetDeviceProperties(&deviceProp, device);
-  int maxBlocks = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlocks, compute_min_g, TPB, 0);
+  cudaDeviceGetAttribute(&nProc, cudaDevAttrMultiProcessorCount, device);
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlocksPerSM, compute_min_grid, TPB, 0);
+  blocks = std::min(blocks, maxBlocksPerSM * nProc);
+  std::cout << "GPU Minimum on " << blocks <<  " blocks (max: " << maxBlocksPerSM  << " * " << nProc << " = " << maxBlocksPerSM * nProc << ")";
+  std::cout << " with cooperative_groups";
+  std::cout << " shared mem max: " << maxShmemSz/1024 << " kiB" << std::endl;
+  std::cout << "  initially: " << gpu_data->min_val << std::endl;
   dim3 dimBlock(TPB, 1, 1);
-  dim3 dimGrid(2, 1, 1);  
-  //dim3 dimGrid(deviceProp.multiProcessorCount*maxBlocks, 1, 1);
-  //size_t shmemSz = sizeof(AsynchronousIterationGPU);
-  std::cout << "  maxBlocks: " << maxBlocks;
-  std::cout << "  shared mem: max=" << maxShmemSz << std::endl;
+  dim3 dimGrid(blocks, 1, 1);  
   auto pdata = gpu_data.get();
   void *args[] = { &pdata };
   cudaEventRecord(start, 0);
-  CUDAEX( cudaLaunchCooperativeKernel(compute_min_g, dimGrid, dimBlock, args) );
+  CUDAEX( cudaLaunchCooperativeKernel(compute_min_grid, dimGrid, dimBlock, args) );
   CUDAEX( cudaDeviceSynchronize() );
   cudaEventRecord(stop, 0);
   cudaEventSynchronize(stop);
   cudaEventElapsedTime(&elapsedTime, start, stop);
   std::cout << "  minimum: " << gpu_data->min_val;
   std::cout << "  iterations: " << gpu_data->iterations;
-  std::cout << "  elapsed (ms): " << elapsedTime << std::endl;
+  std::cout << "  elapsed: " << elapsedTime << " ms" << std::endl;
   if(cpu_min_val != gpu_data->min_val) {
     std::cout << "!! error detected" << std::endl;
   }
