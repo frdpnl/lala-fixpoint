@@ -57,6 +57,7 @@ target_include_directories(lala_fixpoint INTERFACE include)
 
 if(GPU)
   set_source_files_properties(benchmarks/minimum.cpp PROPERTIES LANGUAGE CUDA)
+  set_source_files_properties(benchmarks/bsf.cpp PROPERTIES LANGUAGE CUDA)
 endif()
 
 add_executable(minimum benchmarks/minimum.cpp)
@@ -72,4 +73,16 @@ target_compile_options(minimum PRIVATE
     "$<$<AND:$<BOOL:${WITH_ASAN}>,$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:SHELL:--compiler-options -fsanitize=address>"
 )
 
+add_executable(bsf benchmarks/bsf.cpp)
+target_include_directories(bsf PRIVATE include)
+target_link_libraries(bsf PRIVATE cuda_battery lala_interval)
+target_compile_options(bsf PRIVATE
+    "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:SHELL:--ptxas-options=-v>"
+    "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:--keep$<$<BOOL:${TURBO_VERBOSE}>:;--verbose>>"
+    "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>,$<CONFIG:Debug>>:-ftemplate-backtrace-limit=0>"
+    # Address Sanitizer
+    "$<$<AND:$<BOOL:${WITH_ASAN}>,$<COMPILE_LANGUAGE:CXX>>:-fsanitize=address>"
+    "$<$<AND:$<BOOL:${WITH_ASAN}>,$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:Clang>>:-fsanitize=address>"
+    "$<$<AND:$<BOOL:${WITH_ASAN}>,$<COMPILE_LANGUAGE:CUDA>,$<CUDA_COMPILER_ID:NVIDIA>>:SHELL:--compiler-options -fsanitize=address>"
+)
 

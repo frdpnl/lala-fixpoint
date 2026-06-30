@@ -14,35 +14,42 @@ namespace cg = ::cooperative_groups;
 namespace bt = ::battery;
 using namespace lala;
 
-void init_random_vector(auto& v, size_t to) {
+void init_random_edges(auto& e, unsigned int to) {
   std::mt19937 m{std::random_device{}()};
-  std::uniform_int_distribution<size_t> dist(0, to);
-  for (size_t i=0; i < v.size(); i+=2) {
-      v[i] = dist(m);
-      do { v[i+1] = dist(m); } 
-      while (v[i] == v[i+1]);
-      // duplicate edges are acceptable
+  // 0 is index of sink:
+  std::uniform_int_distribution<unsigned int> rand_vertice(0, to);
+  for (size_t i=0; i < e.size(); i+=2) {
+      e[i] = rand_vertice(m);
+      do { e[i+1] = rand_vertice(m); } 
+      while (e[i] == e[i+1]);
+      if (e[i] > e[i+1]) {
+          std::swap(e[i], e[i+1]);
+      }
+      // duplicate edges are acceptable. just almost wasted computation
+      // almost, because fixpoint helps in this case.
+      // to expose TODO
   }
 }
 
-void init_distances(auto& v) {
-    // v[0] is the sink (or target)
-    v[0].meet_bot();
-    for (size_t i=1; i < v.size(); ++i) {
-        v[i].join_top();
+void init_distances(auto& d) {
+    // d[0] is the sink (or target)
+    d[0].meet_bot();
+    for (size_t i=1; i < d.size(); ++i) {
+        d[i].join_top();
     }
 }
 
 struct MinimumData {
   int iterations;
-  bt::vector<size_t, bt::managed_allocator> data;  // each edge defined by pair of vertices: V2 V4 ...
-  bt::vector<UB<size_t>, bt::managed_allocator> min_val;  // minimum distances from i to sink
+  bt::vector<unsigned int, bt::managed_allocator> edge;  // each edge defined by pair of vertices: V2 V4 ...
+  bt::vector<UB<unsigned int>, bt::managed_allocator> min_dist;  // minimum distances from i to sink
 
-  CUDA MinimumData(size_t edges, size_t vertices)
-  : data(edges*2), min_val(vertices)
+  CUDA MinimumData(unsigned int vertices, unsigned int edges)
+  : edge(edges*2), min_dist(vertices)
   {}
 };
 
+/*
 __global__ void compute_min(MinimumData* m_ptr) {
   MinimumData& m = *m_ptr;
   assert(gridDim.x != 0);
@@ -54,7 +61,9 @@ __global__ void compute_min(MinimumData* m_ptr) {
     [&](int i) { return m.min_val.meet(m.data[block_size * blockIdx.x + i]); }
   );
 }
+*/
 
+/*
 __global__ void compute_min_grid(MinimumData* m_ptr) {
   MinimumData& m = *m_ptr;
   bt::unique_ptr<GridAsynchronousFixpointGPU, bt::global_allocator> fp_engine_ptr;
@@ -66,31 +75,65 @@ __global__ void compute_min_grid(MinimumData* m_ptr) {
   );
   g.sync();
 }
+*/
 
 #define TPB 256
-#define VERTICES 6
-#define EDGES 2<<3
+#define VERTICES 8
+#define EDGES (VERTICES * 2)
 
 int main(int argc, char** argv) {
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-  float elapsedTime;
+  float elapsedTime = 0;
 
-  auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(EDGES, VERTICES);
-  init_random_vector(gpu_data->data, VERTICES -1);
-  init_distances(gpu_data->min_val);
+  auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(VERTICES, EDGES);
+  init_random_edges(gpu_data->edge, VERTICES -1);
+  init_distances(gpu_data->min_dist);
 
-  std::cout << "Data initialized. Starting GPU benchmarks." << std::endl;
+  std::cout << "Edges " << EDGES << ", distances " << VERTICES << " initialized. Starting benchmarks." << std::endl;
+  std::cout << "\tedges: ";
+  // poor man's sort:
+  for (size_t v = 0; v < VERTICES; ++v) {
+      std::cout << v << "->";
+      for (size_t left = 0; left < gpu_data->edge.size()/2; ++left) {
+          if (gpu_data->edge[2*left] == v) {
+            std::cout << gpu_data->edge[2*left+1];
+            std::cout << ",";
+          }
+      }
+      std::cout << " ";
+  }
+  std::cout << std::endl;
+
+  std::cout << "\tinitial distances: ";
+  for (size_t i = 0; i < gpu_data->min_dist.size(); ++i) {
+        std::cout << "d[" << i << "]=" << gpu_data->min_dist[i] << " ";
+  }
+  std::cout << std::endl;
 
   // On CPU, using a sequential fixpoint algorithm.
   GaussSeidelIteration fp_engine;
-  fp_engine.iterate(gpu_data->data.size(), [&](int i) { return gpu_data->min_val.meet(gpu_data->data[i]); });
-  std::cout << "CPU Minimum: " << std::endl;
-  std::cout << "  minimum: " << cpu_min_val << std::endl;
+  fp_engine.fixpoint(
+          gpu_data->edge.size()/2,  /* /2: edges are pairs of vertices */
+          [&](int i) {  unsigned int left_ver = gpu_data->edge[2*i];
+                        unsigned int right_ver = gpu_data->edge[2*i+1];
+                        if (gpu_data->min_dist[left_ver].is_top()) {
+                            return false;
+                        }
+                        return gpu_data->min_dist[right_ver].meet(1 + gpu_data->min_dist[left_ver]);
+                     }
+  );
 
+  std::cout << "\tminimum distances: ";
+  for (size_t i = 0; i < gpu_data->min_dist.size(); ++i) {
+        std::cout << "d[" << i << "]=" << gpu_data->min_dist[i] << " ";
+  }
+  std::cout << std::endl;
+
+  /*
   // On GPU, using a block-parallel fixpoint algorithm.
-  gpu_data->min_val.join_top();
+  init_distances(gpu_data->min_dist);
   int blocks = 1;
   std::cout << "GPU Minimum with " << blocks <<  " block(s)" << std::endl;
   std::cout << "  initially: " << gpu_data->min_val << std::endl;
@@ -108,7 +151,7 @@ int main(int argc, char** argv) {
   }
 
   // On GPU, using a grid-parallel fixpoint algorithm.
-  gpu_data->min_val.join_top();
+  init_distances(gpu_data->min_dist);
   int device = 0, maxShmemSz = 0, nProc = 0, maxBlocksPerSM = 0;
   cudaGetDevice(&device);
   blocks = 2;
@@ -136,6 +179,7 @@ int main(int argc, char** argv) {
   if(cpu_min_val != gpu_data->min_val) {
     std::cout << "!! error detected" << std::endl;
   }
+  */
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
