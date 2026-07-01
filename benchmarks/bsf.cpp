@@ -3,6 +3,7 @@
 #include <limits>
 #include <random>
 #include <iostream>
+#include <chrono>
 #include "battery/vector.hpp"
 #include "battery/allocator.hpp"
 #include "battery/unique_ptr.hpp"
@@ -31,7 +32,7 @@ void init_random_edges(auto& e, unsigned int to) {
   }
 }
 
-void init_distances(auto& d) {
+void reset_dist(auto& d) {
     // d[0] is the sink (or target)
     d[0].meet_bot();
     for (size_t i=1; i < d.size(); ++i) {
@@ -85,91 +86,76 @@ __global__ void compute_min_grid(MinimumData* m_ptr) {
   g.sync();
 }
 
-#define TPB 256
-#define VERTICES 4 
-#define EDGES (VERTICES * 2)
+static void cpu_bsf(const bt::unique_ptr<MinimumData, bt::managed_allocator>& data) 
+{
+  unsigned int vertices{static_cast<unsigned int>(data->min_dist.size())};
+  reset_dist(data->min_dist);
 
-int main(int argc, char** argv) {
-
-  auto cpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(VERTICES, EDGES);
-  init_random_edges(cpu_data->edge, VERTICES -1);
-  init_distances(cpu_data->min_dist);
-
-  std::cout << "Edges " << EDGES << ", distances " << VERTICES << " initialized. Starting benchmarks." << std::endl;
   std::cout << "CPU Minimum" << std::endl;
-  std::cout << "\tedges: ";
-  // poor man's sort:
-  for (size_t v = 0; v < VERTICES; ++v) {
-      std::cout << v << "->";
-      for (size_t left = 0; left < cpu_data->edge.size()/2; ++left) {
-          if (cpu_data->edge[2*left] == v) {
-            std::cout << cpu_data->edge[2*left+1];
-            std::cout << ",";
-          }
-      }
-      std::cout << " ";
-  }
-  std::cout << std::endl;
-
   std::cout << "\tinitial distances: ";
-  for (size_t i = 0; i < cpu_data->min_dist.size(); ++i) {
-        std::cout << "d[" << i << "]=" << cpu_data->min_dist[i] << " ";
+  for (unsigned int i = 0; i < vertices; ++i) {
+        std::cout << "d[" << i << "]=" << data->min_dist[i] << " ";
   }
   std::cout << std::endl;
 
+  auto cpu_start = std::chrono::steady_clock::now();
   // On CPU, using a sequential fixpoint algorithm.
   GaussSeidelIteration fp_engine;
-  cpu_data->iterations = fp_engine.fixpoint(
-          cpu_data->edge.size()/2,  /* /2: edges are pairs of vertices */
-          [&](int i) {  unsigned int left_ver = cpu_data->edge[2*i];
-                        unsigned int right_ver = cpu_data->edge[2*i+1];
+  data->iterations = fp_engine.fixpoint(
+          data->edge.size()/2,  /* /2: edges are pairs of vertices */
+          [&](int i) {  unsigned int left_ver = data->edge[2*i];
+                        unsigned int right_ver = data->edge[2*i+1];
                         bool changed = false;
-                        if (/* right_ver>0 && */ !cpu_data->min_dist[left_ver].is_top()) {
-                            changed |= cpu_data->min_dist[right_ver].meet(1 + cpu_data->min_dist[left_ver]);
+                        if (/* right_ver>0 && */ !data->min_dist[left_ver].is_top()) {
+                            changed |= data->min_dist[right_ver].meet(1 + data->min_dist[left_ver]);
                         }
-                        if (left_ver>0 && !cpu_data->min_dist[right_ver].is_top()) {
-                            changed |= cpu_data->min_dist[left_ver].meet(1 + cpu_data->min_dist[right_ver]);
+                        if (left_ver>0 && !data->min_dist[right_ver].is_top()) {
+                            changed |= data->min_dist[left_ver].meet(1 + data->min_dist[right_ver]);
                         }
                         return changed;
                      }
   );
+  auto cpu_stop = std::chrono::steady_clock::now();
+  auto elapsed = cpu_stop - cpu_start;
 
   std::cout << "\tminimum distances: ";
-  for (size_t i = 0; i < cpu_data->min_dist.size(); ++i) {
-        std::cout << "d[" << i << "]=" << cpu_data->min_dist[i] << " ";
+  for (size_t i = 0; i < vertices; ++i) {
+        std::cout << "d[" << i << "]=" << data->min_dist[i] << " ";
   }
   std::cout << std::endl;
-  std::cout << "\titerations: " << cpu_data->iterations << std::endl;
+  std::cout << "\titerations: " << data->iterations << std::endl;
+  std::cout << "\telapsed: " << elapsed << std::endl;  // TODO figure out conversions...
+}
+
+static void gpu_bsf(const bt::unique_ptr<MinimumData, bt::managed_allocator>& data, int B, int TpB) 
+{
+  unsigned int vertices{static_cast<unsigned int>(data->min_dist.size())};
+  reset_dist(data->min_dist);
 
   // On GPU, using a grid-parallel fixpoint algorithm.
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
-  float elapsedTime = 0;
-
-  auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(VERTICES, EDGES);
-  gpu_data->edge = cpu_data->edge;
-  init_distances(gpu_data->min_dist);
+  float elapsedTime{0};
 
   int device = 0, maxShmemSz = 0, nProc = 0, maxBlocksPerSM = 0;
   cudaGetDevice(&device);
-  int blocks = 2;
   cudaDeviceGetAttribute(&maxShmemSz, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
   cudaDeviceGetAttribute(&nProc, cudaDevAttrMultiProcessorCount, device);
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlocksPerSM, compute_min_grid, TPB, 0);
-  blocks = std::min(blocks, maxBlocksPerSM * nProc);
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlocksPerSM, compute_min_grid, TpB, 0);
+  int blocks = std::min(B, maxBlocksPerSM * nProc);
   std::cout << "GPU Minimum on " << blocks <<  " blocks (max=" << maxBlocksPerSM  << "*" << nProc << "=" << maxBlocksPerSM * nProc << ")";
   std::cout << " with cooperative_groups";
   std::cout << " shared mem max=" << maxShmemSz/1024 << " kiB" << std::endl;
   std::cout << "\tinitial distances: ";
-  for (size_t i = 0; i < gpu_data->min_dist.size(); ++i) {
-        std::cout << "d[" << i << "]=" << gpu_data->min_dist[i] << " ";
+  for (size_t i = 0; i < vertices; ++i) {
+        std::cout << "d[" << i << "]=" << data->min_dist[i] << " ";
   }
   std::cout << std::endl;
 
-  dim3 dimBlock(TPB, 1, 1);
+  dim3 dimBlock(TpB, 1, 1);
   dim3 dimGrid(blocks, 1, 1);  
-  auto pdata = gpu_data.get();
+  auto pdata = data.get();
   void *args[] = { &pdata };
   cudaEventRecord(start, 0);
   CUDAEX( cudaLaunchCooperativeKernel(compute_min_grid, dimGrid, dimBlock, args) );
@@ -182,14 +168,49 @@ int main(int argc, char** argv) {
   cudaEventDestroy(stop);
 
   std::cout << "\tminimum distances: ";
-  for (size_t i = 0; i < gpu_data->min_dist.size(); ++i) {
-        std::cout << "d[" << i << "]=" << gpu_data->min_dist[i] << " ";
+  for (size_t i = 0; i < vertices; ++i) {
+        std::cout << "d[" << i << "]=" << data->min_dist[i] << " ";
   }
   std::cout << std::endl;
-  std::cout << "\titerations: " << gpu_data->iterations;
+  std::cout << "\titerations: " << data->iterations;
   std::cout << "\telapsed: " << elapsedTime << " ms" << std::endl;
+}
 
-  for (unsigned int i=0; i < cpu_data->min_dist.size(); ++i) {
+int main(int argc, char** argv) {
+  if (argc != 5) {
+      std::cerr << "Usage: " << argv[0] << " vertices edges" << std::endl;
+      return 1;
+  }
+  unsigned int edges{static_cast<unsigned int>(std::stoul(argv[1], nullptr, 10))};
+  unsigned int vertices{static_cast<unsigned int>(std::stoul(argv[2], nullptr, 10))};
+  unsigned int blocks{static_cast<unsigned int>(std::stoul(argv[3], nullptr, 10))};
+  unsigned int threadsPerBlock{static_cast<unsigned int>(std::stoul(argv[4], nullptr, 10))};
+
+  auto cpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(vertices, edges);
+  init_random_edges(cpu_data->edge, vertices -1);
+
+  std::cout << "Edges " << edges << ", vertices " << vertices << " initialized." << std::endl;
+  std::cout << "\tedges: ";
+  // poor man's sort:
+  for (unsigned int v = 0; v < vertices; ++v) {
+      std::cout << v << "->";
+      for (unsigned int left = 0; left < edges; ++left) {
+          if (cpu_data->edge[2*left] == v) {
+            std::cout << cpu_data->edge[2*left+1];
+            std::cout << ",";
+          }
+      }
+      std::cout << " ";
+  }
+  std::cout << std::endl;
+
+  cpu_bsf(cpu_data);
+
+  auto gpu_data = bt::make_unique<MinimumData, bt::managed_allocator>(vertices, edges);
+  gpu_data->edge = cpu_data->edge;
+  gpu_bsf(gpu_data, blocks, threadsPerBlock);
+
+  for (unsigned int i=0; i < vertices; ++i) {
       if (cpu_data->min_dist[i] != gpu_data->min_dist[i]) {
           std::cerr << "distance mismatch!" << std::endl;
           return 1;
